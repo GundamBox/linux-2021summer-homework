@@ -65,7 +65,6 @@ static int hook_install(struct ftrace_hook *hook)
     return 0;
 }
 
-#if 0
 void hook_remove(struct ftrace_hook *hook)
 {
     int err = unregister_ftrace_function(&hook->ops);
@@ -75,7 +74,6 @@ void hook_remove(struct ftrace_hook *hook)
     if (err)
         printk("ftrace_set_filter_ip() failed: %d\n", err);
 }
-#endif
 
 typedef struct {
     pid_t id;
@@ -92,8 +90,10 @@ static struct ftrace_hook hook;
 static bool is_hidden_proc(pid_t pid)
 {
     pid_node_t *proc, *tmp_proc;
+    struct pid *pid_struct = find_vpid(pid);
+    struct task_struct *parent = pid_task(pid_struct, PIDTYPE_PID);
     list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
-        if (proc->id == pid)
+        if (proc->id == pid || proc->id == parent->pid)
             return true;
     }
     return false;
@@ -128,8 +128,11 @@ static int unhide_process(pid_t pid)
 {
     pid_node_t *proc, *tmp_proc;
     list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
-        list_del(&proc->list_node);
-        kvfree(proc);
+        if (proc->id == pid) {
+            list_del(&proc->list_node);
+            kvfree(proc);
+            break;
+        }
     }
     return SUCCESS;
 }
@@ -215,8 +218,12 @@ static ssize_t device_write(struct file *filep,
     return len;
 }
 
-static struct cdev cdev;
-static struct class *hideproc_class = NULL;
+static struct hideporc_dev {
+    struct cdev cdev;
+    struct device *device;
+    dev_t devt;
+    struct class *class;
+} hideporc_device;
 
 static const struct file_operations fops = {
     .owner = THIS_MODULE,
@@ -235,7 +242,6 @@ KSYMDEF(vm_list);
 static int _hideproc_init(void)
 {
     int err, dev_major;
-    dev_t dev;
 
     int r;
 
@@ -249,15 +255,17 @@ static int _hideproc_init(void)
         return r;
 
     printk(KERN_INFO "@ %s\n", __func__);
-    err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
-    dev_major = MAJOR(dev);
+    err = alloc_chrdev_region(&hideporc_device.devt, 0, MINOR_VERSION,
+                              DEVICE_NAME);
+    dev_major = MAJOR(hideporc_device.devt);
 
-    hideproc_class = class_create(THIS_MODULE, DEVICE_NAME);
+    hideporc_device.class = class_create(THIS_MODULE, DEVICE_NAME);
 
-    cdev_init(&cdev, &fops);
-    cdev_add(&cdev, MKDEV(dev_major, MINOR_VERSION), 1);
-    device_create(hideproc_class, NULL, MKDEV(dev_major, MINOR_VERSION), NULL,
-                  DEVICE_NAME);
+    cdev_init(&hideporc_device.cdev, &fops);
+    cdev_add(&hideporc_device.cdev, MKDEV(dev_major, MINOR_VERSION), 1);
+    hideporc_device.device =
+        device_create(hideporc_device.class, NULL,
+                      MKDEV(dev_major, MINOR_VERSION), NULL, DEVICE_NAME);
 
     init_hook();
 
@@ -266,8 +274,21 @@ static int _hideproc_init(void)
 
 static void _hideproc_exit(void)
 {
+    pid_node_t *proc, *tmp_proc;
+
     printk(KERN_INFO "@ %s\n", __func__);
     /* FIXME: ensure the release of all allocated resources */
+    hook_remove(&hook);
+    device_destroy(hideporc_device.class,
+                   MKDEV(MAJOR(hideporc_device.devt), MINOR_VERSION));
+    cdev_del(&hideporc_device.cdev);
+    class_destroy(hideporc_device.class);
+    unregister_chrdev_region(hideporc_device.devt, 1);
+
+    list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+        list_del(&proc->list_node);
+        kvfree(proc);
+    }
 }
 
 module_init(_hideproc_init);

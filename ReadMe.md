@@ -27,9 +27,9 @@ contributed by < `GundamBox` >
 
 ## 開發之前
 
-- [作業連結](https://hackmd.io/@sysprog/linux2021-summer-quiz1) 
-- [設定環境遇到的困難](http://gundambox.github.io/2021/07/22/Linux-header%E5%9C%A8%E5%93%AA%E8%A3%A1%EF%BC%9F%E7%B5%95%E5%B0%8D%E9%9B%A3%E4%B8%8D%E5%80%92%E4%BD%A0/)
-- []
+- [作業連結][linux2021-summer-quiz1]
+- [設定環境遇到的困難][where_is_linux_header]
+- [設定環境遇到的困難-part2][install_ubuntu_20]
 
 ## 題目
 
@@ -235,18 +235,104 @@ contributed by < `GundamBox` >
 
 #### 允許其 PPID 也跟著隱藏 ####
 
+- [ ] TODO
+
 ### 4. 指出程式碼可改進的地方，並動手實作 ###
 
-## 後記 ##
+#### 資源釋放 ####
+
+1. 改寫新功能時，`rmmod` 會導致當機，看起來是這段註解寫的問題，拿了資源就要記得還
+    ```c
+    static void _hideproc_exit(void)
+    {
+        printk(KERN_INFO "@ %s\n", __func__);
+        /* FIXME: ensure the release of all allocated resources */
+    }
+    ```
+    - 資源獲取的順序
+        1. alloc_chrdev_region
+        2. class_create
+        3. cdev_add
+        4. device_create
+    - 所以釋放順序應該是
+        1. device_destroy
+        2. cdev_del
+        3. class_destroy
+        4. unregister_chrdev_regio
+2. `hidden_proc` 這個 doubly linked list 配置的資源也要記得還
+    直接把 `unhide_process` 的部分拿過來用就好
+    **注**: 改進的時候才發現這段程式沒有檢查要 unhide 哪個 pid，所以前面隱藏多組 pid 後解除隱藏其中一個會把全部都解除隱藏XD
+3. `hook_remove` 這段原始碼被加上 `#if 0` ，非常可疑XD
+    `hook_install` 有用到 `register_ftrace_function`，`hook_remove` 有用到 `unregister_ftrace_function`，看起來應該是一組的。把 `#if 0` 拿掉後在 `_hideproc_exit` 加上 `hook_remove`。
+
+4. 最終結果
+    ```C
+    static void _hideproc_exit(void)
+    {
+        pid_node_t *proc, *tmp_proc;
+
+        printk(KERN_INFO "@ %s\n", __func__);
+        /* FIXME: ensure the release of all allocated resources */
+        hook_remove(&hook);
+        device_destroy(hideporc_device.class,
+                       MKDEV(MAJOR(hideporc_device.devt), MINOR_VERSION));
+        cdev_del(&hideporc_device.cdev);
+        class_destroy(hideporc_device.class);
+        unregister_chrdev_region(hideporc_device.devt, 1);
+
+        list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+            list_del(&proc->list_node);
+            kvfree(proc);
+        }
+    }
+    ```
+    - `hideporc_device` 是額外寫的 struct，翻原始碼的時候找到的寫法，覺得不錯所以有樣學樣弄一個(誤)
+        ```c
+        static struct hideporc_dev {
+            struct cdev cdev;
+            struct device *device;
+            dev_t devt;
+            struct class *class;
+        } hideporc_device;
+        ```
+#### 解除隱藏 ####
+
+```c=
+list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+    list_del(&proc->list_node);
+    kvfree(proc);
+}
+```
+
+這寫法會解除隱藏所有 pid。如果有多組隱藏的 pid，而且只想解除隱藏一個 pid，就要檢查
+
+```c=
+list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+    if (proc->id == pid) {
+        list_del(&proc->list_node);
+        kvfree(proc);
+        break;
+    }
+}
+```
+
+## 後記與心得 ##
 
 - 找資料過程中一直跳 programmersought 的內容，有附出處的文章 87% 轉自中國文章，沒附出處的文章拿其中一段原始碼搜尋後會找到其他網站的文章，覺得這網站跟內容農場高度相似。已向[終結內容農場][content-farm-terminator]回報網域及加入黑名單
-    - 偷偷在作業結尾宣傳這個 open source，找資料可以避掉很多垃圾文章
+    - 偷偷在作業結尾宣傳這個專案，找資料可以避掉很多垃圾文章
+- 文件會有人類迷惑行為(通常是來不及更新導致)，但原始碼不會，總之先 `git clone https://github.com/torvalds/linux.git` 壓壓驚
 
 ## 參考資訊
 
 1. [kbuild_makefiles][kbuild_makefiles]
 2. [st9540808 開發記錄][st9540808 開發記錄]
+3. [kernel-api - Basic C Library Functions][kernel_api_ch02s02]
+4. [Linux Kernel Repo][linux_kernel_repo]
 
+
+[linux2021-summer-quiz1]: https://hackmd.io/@sysprog/linux2021-summer-quiz1
+[where_is_linux_header]: http://gundambox.github.io/2021/07/22/Linux-header%E5%9C%A8%E5%93%AA%E8%A3%A1%EF%BC%9F%E7%B5%95%E5%B0%8D%E9%9B%A3%E4%B8%8D%E5%80%92%E4%BD%A0
+[install_ubuntu_20]: http://gundambox.github.io/2021/07/28/%E5%AE%89%E8%A3%9D-Ubuntu-20-04-%E9%81%8E%E7%A8%8B%E9%81%87%E5%88%B0%E7%9A%84%E5%B0%8F%E5%95%8F%E9%A1%8C
 [ftrace.txt]: https://www.kernel.org/doc/Documentation/trace/ftrace.txt
 [kallsyms_lookup_name]: https://lwn.net/Articles/813350/
 [kallsyms-mod]: https://github.com/h33p/kallsyms-mod
@@ -254,3 +340,4 @@ contributed by < `GundamBox` >
 [st9540808 開發記錄]: https://hackmd.io/@st9540808/hideproc
 [kernel_api_ch02s02]: https://www.kernel.org/doc/htmldocs/kernel-api/ch02s02.html
 [content-farm-terminator]: https://github.com/danny0838/content-farm-terminator
+[linux_kernel_repo]: https://github.com/torvalds/linux.git
