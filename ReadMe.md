@@ -54,7 +54,7 @@ contributed by < `GundamBox` >
 
 核心模組藉此紀錄被隱藏的 pid
 
-#### ftrace ####
+#### ftrace
 
 - `kallsyms_lookup_name` 找出 `find_ge_pid` 符號的地址
 - hook 這個 function
@@ -66,7 +66,7 @@ contributed by < `GundamBox` >
 > 2020 年的變更 [Unexporting kallsyms_lookup_name()][kallsyms_lookup_name]
 > [Access to kallsyms on Linux 5.7+][kallsyms-mod]
 
-#### 替代方案的演化 ####
+#### 替代方案的演化
 
 :::info
 "file" 的翻譯是「檔案」，"document" 的翻譯是「文件」
@@ -92,7 +92,7 @@ contributed by < `GundamBox` >
 
 - 改 `Makefile`，加入 `kallsyms.o`
 
-    ```shell
+    ```makefile
     MODULENAME := hideproc
     obj-m += $(MODULENAME).o
     $(MODULENAME)-y += main.o kallsyms.o
@@ -123,6 +123,7 @@ contributed by < `GundamBox` >
         ```
         
 - make 成功後，接著執行 `sudo insmod hideproc.ko` 會導致 WSL 死掉
+
     :::warning
     什麼叫做「死掉」？用語請精準！
     :::
@@ -173,9 +174,9 @@ contributed by < `GundamBox` >
     可以正常隱藏 pid
     ~~謎之音: WSL 肯定有偷偷做壞事(誤)~~
 
-### 3. 本核心模組只能隱藏單一 PID，請擴充為允許其 PPID 也跟著隱藏，或允許給定一組 PID 列表，而非僅有單一 PID ###
+### 3. 本核心模組只能隱藏單一 PID，請擴充為允許其 PPID 也跟著隱藏，或允許給定一組 PID 列表，而非僅有單一 PID
 
-#### 允許給定一組 PID 列表，而非僅有單一 PID ####
+#### 允許給定一組 PID 列表，而非僅有單一 PID
 
 - 要從 message 拿出多個 pid 先想到 split 後再把每個 substring 傳入 kstrtol 獲得 pid
 - 但[文件][kernel_api_ch02s02]沒有提到 `strtok`，倒是有 `strsep`，主要改動如下
@@ -218,28 +219,68 @@ contributed by < `GundamBox` >
     ```
 - 執行結果
     ```bash
-    $ sudo insmod hideproc.ko
     $ pidof cron
     592
     $ pidof htop
     3534
     $ echo "add 592,3534" | sudo tee /dev/hideproc
-    $ pidof cron # 什麼都沒發生
-    $ pidof htop # 什麼都沒發生
+    add 592,3534
+    $ pidof cron 
+    # 什麼都沒發生
+    $ pidof htop 
+    # 什麼都沒發生
     $ echo "del 592,3534" | sudo tee /dev/hideproc
+    del 592,3534
     $ pidof cron
     592
     $ pidof htop
     3534
     ```
 
-#### 允許其 PPID 也跟著隱藏 ####
+#### 允許其 PPID 也跟著隱藏
 
-- [ ] TODO
+1. 本來打算在 `is_hidden_proc` 檢查 pid 或 ppid 該不該隱藏
+    - 這樣在 `is_hidden_proc` 反而變成要檢查傳進來的 pid 的 child 有沒有在 list 裡面
+    - 修改原本運作正常 `is_hidden_proc` 會增加無謂的難度跟潛在問題
+    - 放棄這種實作
+2. 改在 `device_write` 這部分實作，隱藏 pid 的同時一起隱藏 ppid
+    - 把 pid 跟 ppid 一起加入 list，這樣就重用原本正常運作的 `is_hidden_proc`
+    - 直接在 `sched.h` 找 "ppid"，果然有現成的 function `task_ppid_nr` 可以用
+    ```c
+    pid_struct = find_vpid(pid);
+    pid_task_struct = pid_task(pid_struct, PIDTYPE_PID);
+    ppid = task_ppid_nr(pid_task_struct);
+    ```
+    **注**: `task_ppid_nr` 的實作有用到 rcu_read_lock，剛好 jserv 老師有提到[ RCU 機制][fb_linux_summer2021_rcu]
+3. 執行
+    - 測試用的 fork.c
+        ```c
+        #include <stdio.h>
+        #include <unistd.h>
 
-### 4. 指出程式碼可改進的地方，並動手實作 ###
+        int main()
+        {
+            fork();
 
-#### 資源釋放 ####
+            printf("Hello world!n");
+            sleep(600000);  // 停十分鐘
+
+            return 0;
+        }
+        ```
+    - 結果
+        ```bash
+        $ pidof my_fork
+        362940 362939
+        $ echo "add 362940" | sudo tee /dev/hideproc
+        add 362940
+        $ pidof my_fork
+        # 什麼都沒發生
+        ```
+
+### 4. 指出程式碼可改進的地方，並動手實作
+
+#### 資源釋放
 
 1. 改寫新功能時，`rmmod` 會導致當機，看起來是這段註解寫的問題，拿了資源就要記得還
     ```c
@@ -254,11 +295,13 @@ contributed by < `GundamBox` >
         2. class_create
         3. cdev_add
         4. device_create
+        5. list_add_tail
     - 所以釋放順序應該是
-        1. device_destroy
-        2. cdev_del
-        3. class_destroy
-        4. unregister_chrdev_regio
+        1. list_del
+        2. device_destroy
+        3. cdev_del
+        4. class_destroy
+        5. unregister_chrdev_regio
 2. `hidden_proc` 這個 doubly linked list 配置的資源也要記得還
     直接把 `unhide_process` 的部分拿過來用就好
     **注**: 改進的時候才發現這段程式沒有檢查要 unhide 哪個 pid，所以前面隱藏多組 pid 後解除隱藏其中一個會把全部都解除隱藏XD
@@ -266,27 +309,28 @@ contributed by < `GundamBox` >
     `hook_install` 有用到 `register_ftrace_function`，`hook_remove` 有用到 `unregister_ftrace_function`，看起來應該是一組的。把 `#if 0` 拿掉後在 `_hideproc_exit` 加上 `hook_remove`。
 
 4. 最終結果
-    ```C
+    ```c
     static void _hideproc_exit(void)
     {
-        pid_node_t *proc, *tmp_proc;
-
         printk(KERN_INFO "@ %s\n", __func__);
         /* FIXME: ensure the release of all allocated resources */
+
+        pid_node_t *proc, *tmp_proc;
+        list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+            list_del(&proc->list_node);
+            kvfree(proc);
+        }
+
         hook_remove(&hook);
         device_destroy(hideporc_device.class,
                        MKDEV(MAJOR(hideporc_device.devt), MINOR_VERSION));
         cdev_del(&hideporc_device.cdev);
         class_destroy(hideporc_device.class);
         unregister_chrdev_region(hideporc_device.devt, 1);
-
-        list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
-            list_del(&proc->list_node);
-            kvfree(proc);
-        }
     }
     ```
-    - `hideporc_device` 是額外寫的 struct，翻原始碼的時候找到的寫法，覺得不錯所以有樣學樣弄一個(誤)
+    - `hideporc_device` 是額外寫的 struct
+        參考 [vas-api.c][vas-api.c] 的寫法 ~~(搜尋原始碼的時候剛好跳第一個，覺得寫法不錯所以有樣學樣弄一個)~~
         ```c
         static struct hideporc_dev {
             struct cdev cdev;
@@ -295,7 +339,8 @@ contributed by < `GundamBox` >
             struct class *class;
         } hideporc_device;
         ```
-#### 解除隱藏 ####
+        
+#### 解除隱藏
 
 ```c=
 list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
@@ -316,7 +361,56 @@ list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
 }
 ```
 
-## 後記與心得 ##
+#### 重複隱藏 pid
+
+`sudo cat /dev/hideproc` 可以列出 list 存了哪些隱藏的 pid，如果重複輸入 pid，例如:
+
+```bash
+$ echo "add 594 594 594" | sudo tee /dev/hideproc
+add 594 594 594
+$ sudo cat /dev/hideproc
+pid: 594
+pid: 1
+pid: 594
+pid: 1
+pid: 594
+pid: 1
+```
+
+1. 防呆做得太爛了，不能忍XD
+2. 新增檢查
+    ```c
+    static int hide_process(pid_t pid)
+    {
+        pid_node_t *proc, *tmp_proc;
+        bool pid_exist = false;
+        list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
+            if (proc->id == pid) {
+                pid_exist = true;
+                break;
+            }
+        }
+
+        if (!pid_exist) {
+            proc = kvmalloc(sizeof(pid_node_t), GFP_KERNEL);
+            proc->id = pid;
+
+            list_add_tail(&proc->list_node, &hidden_proc);
+        }
+        return SUCCESS;
+    }
+    ```
+3. 結果
+    ```bash
+    $ echo "add 594 594 594" | sudo tee /dev/hideproc
+    add 594 594 594
+    $ sudo cat /dev/hideproc
+    pid: 594
+    pid: 1
+    ```
+
+
+## 後記與心得
 
 - 找資料過程中一直跳 programmersought 的內容，有附出處的文章 87% 轉自中國文章，沒附出處的文章拿其中一段原始碼搜尋後會找到其他網站的文章，覺得這網站跟內容農場高度相似。已向[終結內容農場][content-farm-terminator]回報網域及加入黑名單
     - 偷偷在作業結尾宣傳這個專案，找資料可以避掉很多垃圾文章
@@ -328,6 +422,7 @@ list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
 2. [st9540808 開發記錄][st9540808 開發記錄]
 3. [kernel-api - Basic C Library Functions][kernel_api_ch02s02]
 4. [Linux Kernel Repo][linux_kernel_repo]
+5. [The Linux Kernel API][doc_kernel_api]
 
 
 [linux2021-summer-quiz1]: https://hackmd.io/@sysprog/linux2021-summer-quiz1
@@ -339,5 +434,8 @@ list_for_each_entry_safe (proc, tmp_proc, &hidden_proc, list_node) {
 [kbuild_makefiles]: https://www.kernel.org/doc/Documentation/kbuild/makefiles.txt
 [st9540808 開發記錄]: https://hackmd.io/@st9540808/hideproc
 [kernel_api_ch02s02]: https://www.kernel.org/doc/htmldocs/kernel-api/ch02s02.html
+[doc_kernel_api]: https://www.kernel.org/doc/html/latest/core-api/kernel-api.html
 [content-farm-terminator]: https://github.com/danny0838/content-farm-terminator
 [linux_kernel_repo]: https://github.com/torvalds/linux.git
+[fb_linux_summer2021_rcu]: https://www.facebook.com/groups/system.software2021/posts/951980355645021/
+[vas-api.c]: https://github.com/torvalds/linux/blob/v5.8/arch/powerpc/platforms/powernv/vas-api.c
